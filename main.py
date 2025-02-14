@@ -9,23 +9,28 @@ from google.oauth2 import service_account
 from google.cloud import speech_v1p1beta1 as speech
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import google.auth  # Added for default credentials
+import google.auth  # For default credentials
+from google.cloud import storage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
-# Try to load a service account from file, else use default credentials.
+# Load credentials: use service account file if present; otherwise, use default credentials.
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json")
 if os.path.exists(SERVICE_ACCOUNT_PATH):
     credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH)
 else:
     credentials, _ = google.auth.default()
 
-# Now build the Drive service and Speech client with the obtained credentials.
+# Initialize APIs.
 drive_service = build('drive', 'v3', credentials=credentials)
 speech_client = speech.SpeechClient(credentials=credentials)
+storage_client = storage.Client(credentials=credentials)
+
+# Set your GCS bucket name. Either set this environment variable in Cloud Run or replace the default.
+GCS_BUCKET = os.getenv("GCS_BUCKET", "new_bucket_make")  # <-- Replace with your bucket name if not using env variable.
 
 @app.route("/", methods=["GET"])
 def index():
@@ -88,17 +93,40 @@ def transcribe():
         subprocess.run(command, check=True)
         logging.info("ffmpeg conversion complete.")
 
-        # Transcribe the audio.
-        logging.info("Starting transcription...")
-        with open(temp_audio_path, "rb") as audio_file:
-            content = audio_file.read()
-        audio = speech.RecognitionAudio(content=content)
+        # Check the size of the audio file.
+        audio_size = os.path.getsize(temp_audio_path)
+        logging.info(f"Audio file size: {audio_size} bytes")
+
+        # Prepare Speech-to-Text configuration.
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000,
             language_code="en-US"
         )
-        response = speech_client.recognize(config=config, audio=audio)
+        
+        # For audio larger than 10 MB, use asynchronous recognition.
+        if audio_size > 10 * 1024 * 1024:  # 10 MB in bytes.
+            # Upload the audio file to GCS.
+            bucket = storage_client.bucket(GCS_BUCKET)
+            blob_name = os.path.basename(temp_audio_path)
+            blob = bucket.blob(blob_name)
+            blob.upload_from_filename(temp_audio_path)
+            gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+            logging.info(f"Uploaded audio to {gcs_uri}")
+
+            # Use asynchronous (long-running) transcription.
+            audio = speech.RecognitionAudio(uri=gcs_uri)
+            operation = speech_client.long_running_recognize(config=config, audio=audio)
+            response = operation.result(timeout=300)  # Adjust timeout as needed.
+            # Optionally, delete the blob after processing.
+            blob.delete()
+        else:
+            # Use synchronous transcription.
+            with open(temp_audio_path, "rb") as audio_file:
+                content = audio_file.read()
+            audio = speech.RecognitionAudio(content=content)
+            response = speech_client.recognize(config=config, audio=audio)
+        
         logging.info("Transcription complete.")
 
         # Clean up temporary files.
@@ -107,7 +135,7 @@ def transcribe():
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
 
-        # Build transcript string.
+        # Build the transcript.
         transcript = ""
         for result in response.results:
             transcript += result.alternatives[0].transcript
