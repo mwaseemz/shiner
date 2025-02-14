@@ -4,6 +4,7 @@ import subprocess
 import logging
 import io
 import threading
+import time
 import requests
 
 from flask import Flask, request, jsonify
@@ -101,6 +102,7 @@ def process_transcription(data):
 
         # Transcribe audio.
         if audio_size > 10 * 1024 * 1024:  # Larger than 10 MB.
+            logging.info("Audio file exceeds 10MB; using asynchronous transcription.")
             # Upload audio to GCS and use asynchronous transcription.
             bucket = storage_client.bucket(GCS_BUCKET)
             blob_name = os.path.basename(temp_audio_path)
@@ -108,30 +110,44 @@ def process_transcription(data):
             blob.upload_from_filename(temp_audio_path)
             gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
             logging.info(f"Uploaded audio to {gcs_uri}")
+
             audio = speech.RecognitionAudio(uri=gcs_uri)
             operation = speech_client.long_running_recognize(config=config, audio=audio)
+            logging.info("Asynchronous transcription operation started.")
+            # Poll progress every 30 seconds.
+            start_time = time.time()
+            while not operation.done():
+                elapsed = time.time() - start_time
+                logging.info(f"Asynchronous transcription in progress: {int(elapsed)} seconds elapsed...")
+                time.sleep(30)
             response = operation.result(timeout=3600)  # Increase timeout as needed.
-            # Optionally delete the blob.
+            logging.info("Asynchronous transcription operation completed.")
+            # Optionally, delete the blob.
             blob.delete()
         else:
+            logging.info("Using synchronous transcription.")
             # Synchronous transcription.
             with open(temp_audio_path, "rb") as audio_file:
                 content = audio_file.read()
             audio = speech.RecognitionAudio(content=content)
             response = speech_client.recognize(config=config, audio=audio)
+            logging.info("Synchronous transcription completed.")
 
-        logging.info("Transcription complete.")
+        logging.info("Transcription complete. Building transcript...")
+        # Build transcript string.
+        transcript = ""
+        for idx, result in enumerate(response.results):
+            part = result.alternatives[0].transcript
+            transcript += part
+            logging.info(f"Transcript part {idx+1}: {part}")
+
+        logging.info(f"Final transcript length: {len(transcript)} characters")
 
         # Clean up temporary files.
         if os.path.exists(temp_video_path):
             os.remove(temp_video_path)
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
-
-        # Build transcript string.
-        transcript = ""
-        for result in response.results:
-            transcript += result.alternatives[0].transcript
 
         # Send the transcript to the webhook.
         payload = {"transcript": transcript}
