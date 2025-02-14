@@ -3,6 +3,8 @@ import tempfile
 import subprocess
 import logging
 import io
+import threading
+import requests
 
 from flask import Flask, request, jsonify
 from google.oauth2 import service_account
@@ -29,21 +31,14 @@ drive_service = build('drive', 'v3', credentials=credentials)
 speech_client = speech.SpeechClient(credentials=credentials)
 storage_client = storage.Client(credentials=credentials)
 
-# Set your GCS bucket name. Either set this environment variable in Cloud Run or replace the default.
-GCS_BUCKET = os.getenv("GCS_BUCKET", "new_bucket_make")  # <-- Replace with your bucket name if not using env variable.
+# Set your GCS bucket name if using asynchronous transcription.
+GCS_BUCKET = os.getenv("GCS_BUCKET", "new_bucket_make")  # Replace with your bucket name
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Cloud Run video transcriber is up. Send a POST request to /transcribe."
+# Set the webhook URL to which the transcript will be sent.
+WEBHOOK_URL = "https://hook.us2.make.com/hbc5ver5l4bquuf8fm0jrals3faw142d"
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
+def process_transcription(data):
     try:
-        data = request.get_json(silent=True)
-        if not data:
-            logging.error("No JSON data received.")
-            return jsonify({"error": "No JSON data found"}), 400
-
         drive_link = data.get("drive_link")
         file_id = data.get("file_id")
 
@@ -56,14 +51,14 @@ def transcribe():
                     file_id = file_part.split('/')[0]
                 else:
                     logging.error("Could not extract file ID from drive_link.")
-                    return jsonify({"error": "Could not extract file ID from drive_link"}), 400
+                    return
             except Exception as e:
                 logging.exception("Error parsing drive_link")
-                return jsonify({"error": str(e)}), 400
+                return
 
         if not file_id:
             logging.error("No file_id provided or found.")
-            return jsonify({"error": "No file_id provided or found."}), 400
+            return
 
         # Download the video from Google Drive.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
@@ -93,7 +88,7 @@ def transcribe():
         subprocess.run(command, check=True)
         logging.info("ffmpeg conversion complete.")
 
-        # Check the size of the audio file.
+        # Check audio file size.
         audio_size = os.path.getsize(temp_audio_path)
         logging.info(f"Audio file size: {audio_size} bytes")
 
@@ -103,30 +98,28 @@ def transcribe():
             sample_rate_hertz=16000,
             language_code="en-US"
         )
-        
-        # For audio larger than 10 MB, use asynchronous recognition.
-        if audio_size > 10 * 1024 * 1024:  # 10 MB in bytes.
-            # Upload the audio file to GCS.
+
+        # Transcribe audio.
+        if audio_size > 10 * 1024 * 1024:  # Larger than 10 MB.
+            # Upload audio to GCS and use asynchronous transcription.
             bucket = storage_client.bucket(GCS_BUCKET)
             blob_name = os.path.basename(temp_audio_path)
             blob = bucket.blob(blob_name)
             blob.upload_from_filename(temp_audio_path)
             gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
             logging.info(f"Uploaded audio to {gcs_uri}")
-
-            # Use asynchronous (long-running) transcription.
             audio = speech.RecognitionAudio(uri=gcs_uri)
             operation = speech_client.long_running_recognize(config=config, audio=audio)
-            response = operation.result(timeout=300)  # Adjust timeout as needed.
-            # Optionally, delete the blob after processing.
+            response = operation.result(timeout=300)  # Increase timeout as needed.
+            # Optionally delete the blob.
             blob.delete()
         else:
-            # Use synchronous transcription.
+            # Synchronous transcription.
             with open(temp_audio_path, "rb") as audio_file:
                 content = audio_file.read()
             audio = speech.RecognitionAudio(content=content)
             response = speech_client.recognize(config=config, audio=audio)
-        
+
         logging.info("Transcription complete.")
 
         # Clean up temporary files.
@@ -135,17 +128,39 @@ def transcribe():
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
 
-        # Build the transcript.
+        # Build transcript string.
         transcript = ""
         for result in response.results:
             transcript += result.alternatives[0].transcript
 
-        return jsonify({"transcript": transcript}), 200
+        # Send the transcript to the webhook.
+        payload = {"transcript": transcript}
+        webhook_response = requests.post(WEBHOOK_URL, json=payload)
+        logging.info(f"Webhook response: {webhook_response.status_code} - {webhook_response.text}")
 
     except Exception as e:
-        logging.exception("Unhandled exception in /transcribe")
-        return jsonify({"error": str(e)}), 500
+        logging.exception("Unhandled exception in background transcription process")
+        # Optionally, send error details to the webhook.
+        error_payload = {"error": str(e)}
+        try:
+            requests.post(WEBHOOK_URL, json=error_payload)
+        except Exception as ex:
+            logging.exception("Failed to send error payload to webhook")
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe_endpoint():
+    data = request.get_json(silent=True)
+    if not data:
+        logging.error("No JSON data received.")
+        return jsonify({"error": "No JSON data found"}), 400
+    # Start the background transcription process.
+    threading.Thread(target=process_transcription, args=(data,)).start()
+    # Immediately return a success response.
+    return jsonify({"status": "accepted", "message": "Transcription processing started."}), 200
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Cloud Run video transcriber is up. Send a POST request to /transcribe."
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
