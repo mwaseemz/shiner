@@ -110,7 +110,7 @@ def process_transcription(data):
             logging.info(f"Uploaded audio to {gcs_uri}")
             audio = speech.RecognitionAudio(uri=gcs_uri)
             operation = speech_client.long_running_recognize(config=config, audio=audio)
-            response = operation.result(timeout=300)  # Increase timeout as needed.
+            response = operation.result(timeout=3600)  # Increase timeout as needed.
             # Optionally delete the blob.
             blob.delete()
         else:
