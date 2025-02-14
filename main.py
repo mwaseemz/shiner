@@ -9,21 +9,23 @@ from google.oauth2 import service_account
 from google.cloud import speech_v1p1beta1 as speech
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import google.auth  # Added for default credentials
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
-# Credentials: Either use Cloud Run’s Workload Identity or a service account JSON file.
+# Try to load a service account from file, else use default credentials.
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json")
-credentials = None
 if os.path.exists(SERVICE_ACCOUNT_PATH):
     credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH)
+else:
+    credentials, _ = google.auth.default()
 
-# Initialize APIs
-drive_service = build('drive', 'v3', credentials=credentials) if credentials else None
-speech_client = speech.SpeechClient(credentials=credentials) if credentials else speech.SpeechClient()
+# Now build the Drive service and Speech client with the obtained credentials.
+drive_service = build('drive', 'v3', credentials=credentials)
+speech_client = speech.SpeechClient(credentials=credentials)
 
 @app.route("/", methods=["GET"])
 def index():
@@ -58,7 +60,7 @@ def transcribe():
             logging.error("No file_id provided or found.")
             return jsonify({"error": "No file_id provided or found."}), 400
 
-        # Download the video from Google Drive to a temporary file.
+        # Download the video from Google Drive.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
             temp_video_path = temp_video.name
         logging.info("Starting file download from Drive...")
